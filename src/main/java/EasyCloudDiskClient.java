@@ -12,6 +12,8 @@ public class EasyCloudDiskClient {
     private static final int SERVER_PORT = 8888;
     private static final int BUFFER_SIZE = 4096;
     private static final int THREAD_COUNT = 5; // 多线程上传的线程数
+    private static final int CONNECTION_TIMEOUT = 10000; // 连接超时时间
+    private static final int READ_TIMEOUT = 15000; // 读取超时时间
 
     /**
      * 启动客户端
@@ -36,6 +38,8 @@ public class EasyCloudDiskClient {
         try (Socket socket = new Socket(SERVER_ADDRESS, SERVER_PORT);
              DataInputStream dis = new DataInputStream(socket.getInputStream());
              DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+
+            socket.setSoTimeout(READ_TIMEOUT);
 
             // 发送上传命令
             dos.writeUTF("UPLOAD");
@@ -89,6 +93,8 @@ public class EasyCloudDiskClient {
         try (Socket socket = new Socket(SERVER_ADDRESS, SERVER_PORT);
              DataInputStream dis = new DataInputStream(socket.getInputStream());
              DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+
+            socket.setSoTimeout(READ_TIMEOUT);
 
             // 发送多线程上传命令
             dos.writeUTF("UPLOAD_MULTI");
@@ -168,6 +174,8 @@ public class EasyCloudDiskClient {
              DataInputStream dis = new DataInputStream(socket.getInputStream());
              DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
 
+            socket.setSoTimeout(READ_TIMEOUT);
+
             // 发送下载命令
             dos.writeUTF("DOWNLOAD");
             dos.writeUTF(remoteFilePath);
@@ -217,179 +225,209 @@ public class EasyCloudDiskClient {
     }
 
     /**
-     * Bonus:多线程下载文件
+     * Bonus:多线程下载文件 - 修复版本
      *
      * @param remoteFilePath 云盘文件路径
      * @param localFilePath  本地文件路径
      */
     public void downloadFileMultiThread(String remoteFilePath, String localFilePath) {
-        try (Socket socket = new Socket(SERVER_ADDRESS, SERVER_PORT)) {
-            socket.setSoTimeout(10000); // 设置10秒超时
+        // 首先获取文件信息
+        long fileSize;
+        String serverMD5;
 
-            try (DataInputStream dis = new DataInputStream(socket.getInputStream());
-                 DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+        try (Socket infoSocket = new Socket(SERVER_ADDRESS, SERVER_PORT);
+             DataInputStream infoDis = new DataInputStream(infoSocket.getInputStream());
+             DataOutputStream infoDos = new DataOutputStream(infoSocket.getOutputStream())) {
 
-                // 首先获取文件信息
-                dos.writeUTF("DOWNLOAD");
-                dos.writeUTF(remoteFilePath);
+            infoSocket.setSoTimeout(READ_TIMEOUT);
 
-                // 检查文件是否存在
-                boolean fileExists = dis.readBoolean();
-                if (!fileExists) {
-                    System.err.println("云盘文件不存在: " + remoteFilePath);
-                    return;
-                }
+            // 获取文件信息
+            infoDos.writeUTF("DOWNLOAD");
+            infoDos.writeUTF(remoteFilePath);
 
-                // 获取文件大小和MD5
-                long fileSize = dis.readLong();
-                String serverMD5 = dis.readUTF();
-
-                // 读取完文件信息后关闭这个连接
-                byte[] buffer = new byte[BUFFER_SIZE];
-                int bytesRead;
-                while (dis.available() > 0) {
-                    dis.read(buffer);
-                }
+            boolean fileExists = infoDis.readBoolean();
+            if (!fileExists) {
+                System.err.println("云盘文件不存在: " + remoteFilePath);
+                return;
             }
 
-            // 创建目录（如果需要）
-            File localFile = new File(localFilePath);
-            localFile.getParentFile().mkdirs();
+            fileSize = infoDis.readLong();
+            serverMD5 = infoDis.readUTF();
 
-            // 计算每个线程下载的块大小
-            long fileSize = new File(localFilePath).length();
-            int chunkSize = (int) Math.ceil((double) fileSize / THREAD_COUNT);
-
-            // 准备临时文件
-            File[] tempFiles = new File[THREAD_COUNT];
-            for (int i = 0; i < THREAD_COUNT; i++) {
-                tempFiles[i] = new File(localFilePath + ".part" + i);
+            // 读取并丢弃文件内容，因为我们只需要文件信息
+            byte[] buffer = new byte[BUFFER_SIZE];
+            while (infoDis.available() > 0) {
+                infoDis.read(buffer);
             }
 
-            // 使用线程池并行下载文件块
-            ExecutorService executor = Executors.newFixedThreadPool(THREAD_COUNT);
-            List<Future<?>> futures = new ArrayList<>();
+        } catch (IOException e) {
+            System.err.println("获取文件信息失败: " + e.getMessage());
+            return;
+        }
 
-            for (int i = 0; i < THREAD_COUNT; i++) {
-                final int chunkIndex = i;
-                final long startPos = (long) chunkIndex * chunkSize;
-                final long endPos = Math.min(startPos + chunkSize, fileSize);
-                final File tempFile = tempFiles[chunkIndex];
+        // 创建目录（如果需要）
+        File localFile = new File(localFilePath);
+        localFile.getParentFile().mkdirs();
 
-                Future<?> future = executor.submit(() -> {
-                    Socket chunkSocket = null;
+        // 计算每个线程下载的块大小
+        long chunkSize = fileSize / THREAD_COUNT;
+        if (fileSize % THREAD_COUNT != 0) {
+            chunkSize++;
+        }
+
+        // 准备临时文件
+        File[] tempFiles = new File[THREAD_COUNT];
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            tempFiles[i] = new File(localFilePath + ".part" + i);
+        }
+
+        // 使用线程池并行下载文件块，但限制并发连接数
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(THREAD_COUNT, 3)); // 限制最大并发连接数为3
+        List<Future<Boolean>> futures = new ArrayList<>();
+        CountDownLatch latch = new CountDownLatch(THREAD_COUNT);
+
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            final int chunkIndex = i;
+            final long startPos = (long) chunkIndex * chunkSize;
+            final long endPos = Math.min(startPos + chunkSize, fileSize);
+            final File tempFile = tempFiles[chunkIndex];
+
+            if (startPos >= fileSize) {
+                latch.countDown();
+                continue;
+            }
+
+            Future<Boolean> future = executor.submit(() -> {
+                boolean success = false;
+                int retryCount = 0;
+                int maxRetries = 3;
+
+                while (!success && retryCount < maxRetries) {
                     try {
-                        chunkSocket = new Socket(SERVER_ADDRESS, SERVER_PORT);
-                        chunkSocket.setSoTimeout(10000); // 设置10秒超时
+                        // 添加重试间隔
+                        if (retryCount > 0) {
+                            Thread.sleep(1000 * retryCount);
+                        }
+
+                        Socket chunkSocket = new Socket(SERVER_ADDRESS, SERVER_PORT);
+                        chunkSocket.setSoTimeout(READ_TIMEOUT);
+                        chunkSocket.setTcpNoDelay(true);
 
                         try (DataInputStream chunkDis = new DataInputStream(chunkSocket.getInputStream());
-                             DataOutputStream chunkDos = new DataOutputStream(chunkSocket.getOutputStream())) {
+                             DataOutputStream chunkDos = new DataOutputStream(chunkSocket.getOutputStream());
+                             FileOutputStream fos = new FileOutputStream(tempFile)) {
 
                             // 发送范围下载请求
                             chunkDos.writeUTF("RANGE_DOWNLOAD");
                             chunkDos.writeUTF(remoteFilePath);
                             chunkDos.writeLong(startPos);
                             chunkDos.writeLong(endPos - startPos);
+                            chunkDos.flush();
 
                             // 接收数据块
-                            try (FileOutputStream fos = new FileOutputStream(tempFile)) {
-                                byte[] chunkBuffer = new byte[BUFFER_SIZE];
-                                int chunkBytesRead;
-                                long remaining = endPos - startPos;
+                            byte[] chunkBuffer = new byte[BUFFER_SIZE];
+                            int chunkBytesRead;
+                            long remaining = endPos - startPos;
 
-                                while (remaining > 0) {
-                                    chunkBytesRead = chunkDis.read(chunkBuffer, 0, (int) Math.min(chunkBuffer.length, remaining));
-                                    if (chunkBytesRead == -1) break;
+                            while (remaining > 0) {
+                                chunkBytesRead = chunkDis.read(chunkBuffer, 0, (int) Math.min(chunkBuffer.length, remaining));
+                                if (chunkBytesRead == -1) break;
 
-                                    fos.write(chunkBuffer, 0, chunkBytesRead);
-                                    remaining -= chunkBytesRead;
-                                }
+                                fos.write(chunkBuffer, 0, chunkBytesRead);
+                                remaining -= chunkBytesRead;
                             }
 
+                            success = true;
                             System.out.println("下载分块 " + chunkIndex + " 完成: 位置 " + startPos + "-" + (endPos-1));
-                        }
-                    } catch (IOException e) {
-                        System.err.println("下载分块 " + chunkIndex + " 错误: " + e.getMessage());
-                        e.printStackTrace();
-                    } finally {
-                        // 确保Socket被关闭
-                        if (chunkSocket != null && !chunkSocket.isClosed()) {
+                        } finally {
                             try {
                                 chunkSocket.close();
                             } catch (IOException e) {
-                                e.printStackTrace();
+                                // 忽略关闭异常
                             }
                         }
-                    }
-                });
-
-                futures.add(future);
-            }
-
-            // 等待所有下载任务完成
-            for (Future<?> future : futures) {
-                try {
-                    future.get();
-                } catch (InterruptedException | ExecutionException e) {
-                    System.err.println("等待下载任务完成时出错: " + e.getMessage());
-                    e.printStackTrace();
-                }
-            }
-
-            executor.shutdown();
-
-            // 合并所有分块
-            try (FileOutputStream fos = new FileOutputStream(localFile)) {
-                for (int i = 0; i < THREAD_COUNT; i++) {
-                    File tempFile = tempFiles[i];
-                    if (tempFile.exists()) {
-                        try (FileInputStream fis = new FileInputStream(tempFile)) {
-                            byte[] mergeBuffer = new byte[BUFFER_SIZE];
-                            int mergeBytesRead;
-
-                            while ((mergeBytesRead = fis.read(mergeBuffer)) != -1) {
-                                fos.write(mergeBuffer, 0, mergeBytesRead);
-                            }
+                    } catch (Exception e) {
+                        retryCount++;
+                        System.err.println("下载分块 " + chunkIndex + " 失败 (重试 " + retryCount + "/" + maxRetries + "): " + e.getMessage());
+                        if (retryCount >= maxRetries) {
+                            System.err.println("分块 " + chunkIndex + " 下载最终失败");
                         }
-                        // 删除临时文件
-                        tempFile.delete();
                     }
                 }
-            }
 
-            // 验证MD5
+                latch.countDown();
+                return success;
+            });
+
+            futures.add(future);
+        }
+
+        // 等待所有下载任务完成
+        try {
+            latch.await(60, TimeUnit.SECONDS); // 设置最大等待时间为60秒
+        } catch (InterruptedException e) {
+            System.err.println("等待下载任务完成时被中断: " + e.getMessage());
+        }
+
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+        }
+
+        // 检查所有任务是否成功
+        boolean allSuccess = true;
+        for (Future<Boolean> future : futures) {
+            try {
+                if (!future.get()) {
+                    allSuccess = false;
+                }
+            } catch (Exception e) {
+                allSuccess = false;
+                System.err.println("获取下载任务结果时出错: " + e.getMessage());
+            }
+        }
+
+        if (!allSuccess) {
+            System.err.println("部分分块下载失败，取消合并操作");
+            return;
+        }
+
+        // 合并所有分块
+        try (FileOutputStream fos = new FileOutputStream(localFile)) {
+            for (int i = 0; i < THREAD_COUNT; i++) {
+                File tempFile = tempFiles[i];
+                if (tempFile.exists() && tempFile.length() > 0) {
+                    try (FileInputStream fis = new FileInputStream(tempFile)) {
+                        byte[] mergeBuffer = new byte[BUFFER_SIZE];
+                        int mergeBytesRead;
+
+                        while ((mergeBytesRead = fis.read(mergeBuffer)) != -1) {
+                            fos.write(mergeBuffer, 0, mergeBytesRead);
+                        }
+                    }
+                    // 删除临时文件
+                    tempFile.delete();
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("合并文件失败: " + e.getMessage());
+            return;
+        }
+
+        // 验证MD5
+        try {
             String clientMD5 = MD5Util.calculateMD5(localFilePath);
-            String serverMD5 = ""; // 从之前的连接中获取
-
-            // 再次连接以获取MD5（如果需要）
-            try (Socket verifySocket = new Socket(SERVER_ADDRESS, SERVER_PORT);
-                 DataInputStream verifyDis = new DataInputStream(verifySocket.getInputStream());
-                 DataOutputStream verifyDos = new DataOutputStream(verifySocket.getOutputStream())) {
-
-                verifyDos.writeUTF("DOWNLOAD");
-                verifyDos.writeUTF(remoteFilePath);
-
-                boolean exists = verifyDis.readBoolean();
-                if (exists) {
-                    verifyDis.readLong(); // 跳过文件大小
-                    serverMD5 = verifyDis.readUTF(); // 获取MD5
-                }
-            }
-
             if (serverMD5.equals(clientMD5)) {
                 System.out.println("多线程文件下载成功: " + remoteFilePath + " -> " + localFilePath);
             } else {
                 System.err.println("多线程文件下载失败，MD5校验不匹配: " + remoteFilePath);
             }
-
-            // 在完成后确保所有连接都已关闭
-            System.out.println("多线程下载完成，所有连接已关闭");
-            // 给系统一些时间来释放资源
-            Thread.sleep(500);
-
-        } catch (IOException | InterruptedException e) {
-            System.err.println("多线程下载文件错误: " + e.getMessage());
-            e.printStackTrace();
+        } catch (Exception e) {
+            System.err.println("MD5校验失败: " + e.getMessage());
         }
     }
 
@@ -400,24 +438,24 @@ public class EasyCloudDiskClient {
      */
     public List<FileInfo> getFileList() {
         List<FileInfo> fileList = new ArrayList<>();
-        int maxRetries = 3; // 最大重试次数
+        int maxRetries = 3; // 减少重试次数
         int retryCount = 0;
         boolean success = false;
 
         while (!success && retryCount < maxRetries) {
+            Socket socket = null;
             try {
                 if (retryCount > 0) {
                     System.out.println("正在尝试重新获取文件列表，第 " + retryCount + " 次重试...");
-                    // 在重试前等待一段时间
-                    Thread.sleep(1000);
+                    Thread.sleep(2000 * retryCount); // 增加重试间隔
                 }
 
-                // 创建新的连接
-                try (Socket socket = new Socket(SERVER_ADDRESS, SERVER_PORT);
-                     DataInputStream dis = new DataInputStream(socket.getInputStream());
-                     DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+                socket = new Socket(SERVER_ADDRESS, SERVER_PORT);
+                socket.setSoTimeout(READ_TIMEOUT);
+                socket.setTcpNoDelay(true);
 
-                    socket.setSoTimeout(5000); // 设置更短的超时时间
+                try (DataInputStream dis = new DataInputStream(socket.getInputStream());
+                     DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
 
                     // 发送列表命令
                     dos.writeUTF("LIST");
@@ -434,7 +472,7 @@ public class EasyCloudDiskClient {
                         fileList.add(new FileInfo(filePath, fileSize));
                     }
 
-                    success = true; // 如果没有异常，则标记为成功
+                    success = true;
                 }
             } catch (IOException | InterruptedException e) {
                 System.err.println("获取文件列表错误: " + e.getMessage());
@@ -443,8 +481,15 @@ public class EasyCloudDiskClient {
                     System.err.println("达到最大重试次数，无法获取文件列表");
                     e.printStackTrace();
                 }
-                // 清空已获取的文件列表，准备重试
                 fileList.clear();
+            } finally {
+                if (socket != null && !socket.isClosed()) {
+                    try {
+                        socket.close();
+                    } catch (IOException e) {
+                        // 忽略关闭异常
+                    }
+                }
             }
         }
 
@@ -460,6 +505,8 @@ public class EasyCloudDiskClient {
         try (Socket socket = new Socket(SERVER_ADDRESS, SERVER_PORT);
              DataInputStream dis = new DataInputStream(socket.getInputStream());
              DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+
+            socket.setSoTimeout(READ_TIMEOUT * 2); // 批量操作需要更长的超时时间
 
             // 发送批量上传命令
             dos.writeUTF("BATCH_UPLOAD");
@@ -517,6 +564,8 @@ public class EasyCloudDiskClient {
         try (Socket socket = new Socket(SERVER_ADDRESS, SERVER_PORT);
              DataInputStream dis = new DataInputStream(socket.getInputStream());
              DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+
+            socket.setSoTimeout(READ_TIMEOUT * 2); // 批量操作需要更长的超时时间
 
             // 发送批量下载命令
             dos.writeUTF("BATCH_DOWNLOAD");

@@ -189,14 +189,27 @@ public class EasyCloudDiskServer {
         try (FileInputStream fis = new FileInputStream(file)) {
             byte[] buffer = new byte[BUFFER_SIZE];
             int bytesRead;
+            long totalSent = 0;
 
-            while ((bytesRead = fis.read(buffer)) != -1) {
-                dos.write(buffer, 0, bytesRead);
+            try {
+                while ((bytesRead = fis.read(buffer)) != -1) {
+                    dos.write(buffer, 0, bytesRead);
+                    totalSent += bytesRead;
+
+                    // 每发送一定量的数据就刷新缓冲区，避免缓冲区溢出
+                    if (totalSent % (BUFFER_SIZE * 10) == 0) {
+                        dos.flush();
+                    }
+                }
+                dos.flush();
+                System.out.println("文件发送完成: " + filePath);
+            } catch (IOException e) {
+                System.err.println("文件发送过程中发生错误: " + e.getMessage() + " (已发送 " + totalSent + "/" + fileSize + " 字节)");
+                // 不再向上层抛出异常，这样可以避免整个handleClient方法失败
+                // 只是记录错误并返回
+                return;
             }
-            dos.flush();
         }
-
-        System.out.println("文件发送完成: " + filePath);
     }
 
     // 处理文件列表请求
@@ -258,7 +271,7 @@ public class EasyCloudDiskServer {
                 long fileSize = dis.readLong();
                 String clientMD5 = dis.readUTF();
 
-                System.out.println("正在接收批量文件[" + (i+1) + "/" + fileCount + "]: " + filePath + ", 大小: " + fileSize + " 字节");
+                System.out.println("正在接收批量文件[" + (i + 1) + "/" + fileCount + "]: " + filePath + ", 大小: " + fileSize + " 字节");
 
                 // 创建目录（如果需要）
                 File file = new File(remotePath);
@@ -286,7 +299,7 @@ public class EasyCloudDiskServer {
                 boolean md5Match = serverMD5.equals(clientMD5);
                 dos.writeBoolean(md5Match);
 
-                System.out.println("批量文件[" + (i+1) + "/" + fileCount + "]接收完成: " + filePath + ", MD5校验: " + (md5Match ? "成功" : "失败"));
+                System.out.println("批量文件[" + (i + 1) + "/" + fileCount + "]接收完成: " + filePath + ", MD5校验: " + (md5Match ? "成功" : "失败"));
             }
 
             System.out.println("批量上传完成，共 " + fileCount + " 个文件");
@@ -309,7 +322,7 @@ public class EasyCloudDiskServer {
                 String remotePath = CLOUD_DIR + filePath;
                 File file = new File(remotePath);
 
-                System.out.println("处理批量下载文件[" + (i+1) + "/" + fileCount + "]: " + filePath);
+                System.out.println("处理批量下载文件[" + (i + 1) + "/" + fileCount + "]: " + filePath);
 
                 // 检查文件是否存在
                 if (!file.exists() || !file.isFile()) {
@@ -332,21 +345,33 @@ public class EasyCloudDiskServer {
                 try (FileInputStream fis = new FileInputStream(file)) {
                     byte[] buffer = new byte[BUFFER_SIZE];
                     int bytesRead;
+                    long totalSent = 0;
 
-                    while ((bytesRead = fis.read(buffer)) != -1) {
-                        dos.write(buffer, 0, bytesRead);
+                    try {
+                        while ((bytesRead = fis.read(buffer)) != -1) {
+                            dos.write(buffer, 0, bytesRead);
+                            totalSent += bytesRead;
+
+                            // 每发送一定量的数据就刷新缓冲区，避免缓冲区溢出
+                            if (totalSent % (BUFFER_SIZE * 10) == 0) {
+                                dos.flush();
+                            }
+                        }
+                        dos.flush();
+                        System.out.println("批量文件[" + (i + 1) + "/" + fileCount + "]发送完成: " + filePath);
+                    } catch (IOException e) {
+                        System.err.println("批量文件[" + (i + 1) + "/" + fileCount + "]发送过程中发生错误: " + e.getMessage() + " (已发送 " + totalSent + "/" + fileSize + " 字节)");
+                        // 如果一个文件发送失败，尝试继续发送下一个文件
+                        continue;
                     }
-                    dos.flush();
                 }
-
-                System.out.println("批量文件[" + (i+1) + "/" + fileCount + "]发送完成: " + filePath);
             }
 
             System.out.println("批量下载完成，共 " + fileCount + " 个文件");
         } catch (IOException e) {
             System.err.println("批量下载处理错误: " + e.getMessage());
             e.printStackTrace();
-            throw e;  // 重新抛出异常，让上层处理
+            // 不再向上抛出异常
         }
     }
 
@@ -371,21 +396,31 @@ public class EasyCloudDiskServer {
             byte[] buffer = new byte[BUFFER_SIZE];
             int bytesRead;
             long remaining = length;
+            long totalSent = 0;
 
-            while (remaining > 0) {
-                bytesRead = raf.read(buffer, 0, (int) Math.min(buffer.length, remaining));
-                if (bytesRead == -1) break;
+            try {
+                while (remaining > 0) {
+                    bytesRead = raf.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                    if (bytesRead == -1) break;
 
-                dos.write(buffer, 0, bytesRead);
-                remaining -= bytesRead;
+                    dos.write(buffer, 0, bytesRead);
+                    remaining -= bytesRead;
+                    totalSent += bytesRead;
+
+                    // 每发送一定量的数据就刷新缓冲区，避免缓冲区溢出
+                    if (totalSent % (BUFFER_SIZE * 10) == 0) {
+                        dos.flush();
+                    }
+                }
+                dos.flush();
+                System.out.println("范围下载完成: " + filePath + ", 位置: " + startPos + ", 长度: " + length);
+            } catch (IOException e) {
+                System.err.println("范围下载过程中发生错误: " + e.getMessage() +
+                                 " (已发送 " + totalSent + "/" + length + " 字节, 位置: " + startPos + ")");
+                // 不再向上层抛出异常，这样可以避免整个handleClient方法失败
+                return;
             }
-            dos.flush();
         }
-
-        System.out.println("范围下载完成: " + filePath + ", 位置: " + startPos + ", 长度: " + length);
-
-        // 确保流和套接字在方法结束后被关闭
-        // 这在try-with-resources中已经自动处理，但在这里明确一下
     }
 
     // 计算文件的MD5值
