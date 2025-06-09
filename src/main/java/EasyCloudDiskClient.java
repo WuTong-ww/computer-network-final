@@ -231,7 +231,7 @@ public class EasyCloudDiskClient {
      * @param localFilePath  本地文件路径
      */
     public void downloadFileMultiThread(String remoteFilePath, String localFilePath) {
-        // 首先获取文件信息
+        // 首先通过范围下载获取文件信息，避免下载整个文件
         long fileSize;
         String serverMD5;
 
@@ -241,9 +241,31 @@ public class EasyCloudDiskClient {
 
             infoSocket.setSoTimeout(READ_TIMEOUT);
 
+            // 使用范围下载获取文件大小，只下载第一个字节
+            infoDos.writeUTF("RANGE_DOWNLOAD");
+            infoDos.writeUTF(remoteFilePath);
+            infoDos.writeLong(0); // 从位置0开始
+            infoDos.writeLong(1); // 只下载1个字节
+            infoDos.flush();
+
+            // 读取并丢弃这1个字节
+            infoDis.read();
+
+        } catch (IOException e) {
+            System.err.println("获取文件信息失败，尝试使用标准下载方式: " + e.getMessage());
+        }
+
+        // 使用标准下载方式获取文件信息
+        try (Socket infoSocket = new Socket(SERVER_ADDRESS, SERVER_PORT);
+             DataInputStream infoDis = new DataInputStream(infoSocket.getInputStream());
+             DataOutputStream infoDos = new DataOutputStream(infoSocket.getOutputStream())) {
+
+            infoSocket.setSoTimeout(READ_TIMEOUT);
+
             // 获取文件信息
             infoDos.writeUTF("DOWNLOAD");
             infoDos.writeUTF(remoteFilePath);
+            infoDos.flush();
 
             boolean fileExists = infoDis.readBoolean();
             if (!fileExists) {
@@ -254,11 +276,8 @@ public class EasyCloudDiskClient {
             fileSize = infoDis.readLong();
             serverMD5 = infoDis.readUTF();
 
-            // 读取并丢弃文件内容，因为我们只需要文件信息
-            byte[] buffer = new byte[BUFFER_SIZE];
-            while (infoDis.available() > 0) {
-                infoDis.read(buffer);
-            }
+            // 关闭连接前设置SO_LINGER，避免服务器端报错
+            infoSocket.setSoLinger(true, 0);
 
         } catch (IOException e) {
             System.err.println("获取文件信息失败: " + e.getMessage());

@@ -204,9 +204,16 @@ public class EasyCloudDiskServer {
                 dos.flush();
                 System.out.println("文件发送完成: " + filePath);
             } catch (IOException e) {
-                System.err.println("文件发送过程中发生错误: " + e.getMessage() + " (已发送 " + totalSent + "/" + fileSize + " 字节)");
+                // 检查是否是客户端主动断开连接（这在多线程下载中是正常的）
+                if (e.getMessage().contains("你的主机中的软件中止了一个已建立的连接") ||
+                        e.getMessage().contains("Connection reset") ||
+                        e.getMessage().contains("Broken pipe")) {
+                    System.out.println("客户端提前断开连接 : " + filePath );
+                } else {
+                    System.err.println("文件发送过程中发生错误: " + e.getMessage() +
+                            " (已发送 " + totalSent + "/" + fileSize + " 字节)");
+                }
                 // 不再向上层抛出异常，这样可以避免整个handleClient方法失败
-                // 只是记录错误并返回
                 return;
             }
         }
